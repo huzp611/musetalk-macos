@@ -258,7 +258,8 @@ class MuseTalkPipeline:
                 frame = frame_list_cycle[idx].copy()
 
                 if coord == coord_placeholder:
-                    output_frames.append(frame)
+                    # 无人脸帧，BGR 转 RGB 保持一致
+                    output_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     continue
 
                 # 使用 UNet 预测
@@ -285,13 +286,14 @@ class MuseTalkPipeline:
                 y1, y2, x1, x2 = coord
                 h, w = y2 - y1, x2 - x1
                 if h <= 0 or w <= 0:
-                    output_frames.append(frame)
+                    # 无效坐标，BGR 转 RGB 保持一致
+                    output_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     continue
                 pred_frame_resized = cv2.resize(pred_frame.astype(np.uint8), (w, h), interpolation=cv2.INTER_LANCZOS4)
 
                 # 使用人脸解析进行混合
                 # get_image 期望: BGR 原图, BGR 人脸, [x1,y1,x2,y2]
-                # 返回: BGR 格式的混合图像
+                # 返回: RGB 格式的混合图像（内部做了两次 [::-1] 转换）
                 frame = get_image(
                     frame,  # 完整原图 (BGR)
                     pred_frame_resized,  # 生成的人脸 (BGR)
@@ -307,8 +309,9 @@ class MuseTalkPipeline:
             frame_dir_out.mkdir(exist_ok=True)
 
             for i, frame in enumerate(output_frames):
-                # frame 已经是 BGR 格式，直接保存
-                cv2.imwrite(str(frame_dir_out / f"{i:08d}.png"), frame)
+                # get_image 返回 RGB 格式，需要转换为 BGR 再保存
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(frame_dir_out / f"{i:08d}.png"), frame_bgr)
 
             # 合成视频
             silent_video = str(temp_dir / "silent.mp4")
