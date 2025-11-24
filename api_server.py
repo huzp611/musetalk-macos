@@ -214,18 +214,17 @@ class MuseTalkPipeline:
             # 批量获取人脸关键点和边界框
             bbox_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
 
-            # 转换帧为 RGB 并处理
+            # 处理帧 - 保持 BGR 格式（VAE 和 blending 都期望 BGR）
             coord_list = []
             for idx, (bbox, frame) in enumerate(zip(bbox_list, frame_list)):
-                # frame 已经是 BGR，转为 RGB
-                frame_list[idx] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = frame_list[idx]
+                # frame 已经是 BGR，保持 BGR 格式
+                # frame_list 保持原样，不做颜色转换
 
                 if bbox == coord_placeholder:
                     coord_list.append(coord_placeholder)
                     continue
 
-                # 裁剪人脸区域
+                # 裁剪人脸区域（BGR 格式）
                 x1, y1, x2, y2 = bbox
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
@@ -277,9 +276,9 @@ class MuseTalkPipeline:
                     encoder_hidden_states=audio_feature
                 ).sample
 
-                # 解码 - decode_latents 返回 (batch, h, w, c) 数组，取第一个
+                # 解码 - decode_latents 返回 (batch, h, w, c) BGR 数组，取第一个
                 pred_frames = self.vae.decode_latents(pred_latent)
-                pred_frame = pred_frames[0]  # 取 batch 中的第一帧
+                pred_frame = pred_frames[0]  # 取 batch 中的第一帧，已经是 BGR
 
                 # 混合回原图
                 # coord 存储为 (y1, y2, x1, x2)，需要转换为 get_image 需要的 [x1, y1, x2, y2]
@@ -290,10 +289,12 @@ class MuseTalkPipeline:
                     continue
                 pred_frame_resized = cv2.resize(pred_frame.astype(np.uint8), (w, h), interpolation=cv2.INTER_LANCZOS4)
 
-                # 使用人脸解析进行混合 - get_image(原图, 生成的人脸, [x1,y1,x2,y2], fp=...)
+                # 使用人脸解析进行混合
+                # get_image 期望: BGR 原图, BGR 人脸, [x1,y1,x2,y2]
+                # 返回: BGR 格式的混合图像
                 frame = get_image(
-                    frame,  # 完整原图
-                    pred_frame_resized,  # 生成的人脸
+                    frame,  # 完整原图 (BGR)
+                    pred_frame_resized,  # 生成的人脸 (BGR)
                     [x1, y1, x2, y2],  # face_box 坐标
                     fp=self.face_parser
                 )
@@ -306,8 +307,8 @@ class MuseTalkPipeline:
             frame_dir_out.mkdir(exist_ok=True)
 
             for i, frame in enumerate(output_frames):
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(frame_dir_out / f"{i:08d}.png"), frame_bgr)
+                # frame 已经是 BGR 格式，直接保存
+                cv2.imwrite(str(frame_dir_out / f"{i:08d}.png"), frame)
 
             # 合成视频
             silent_video = str(temp_dir / "silent.mp4")
