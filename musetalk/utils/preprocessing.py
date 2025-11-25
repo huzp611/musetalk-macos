@@ -23,14 +23,17 @@ from mmpose.structures import merge_data_samples
 from tqdm import tqdm
 
 # initialize the mmpose model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# NOTE: mmpose/mmcv has poor MPS support, keep on CPU for stability
+# This preprocessing only runs once per video, not per frame
+device = torch.device("cpu")
 config_file = './musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'
 checkpoint_file = './models/dwpose/dw-ll_ucoco_384.pth'
 model = init_model(config_file, checkpoint_file, device=device)
 
 # initialize the face detection model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-fa = FaceAlignment(LandmarksType.TWO_D, flip_input=False,device=device)
+# face_alignment also stays on CPU for compatibility
+device_str = "cpu"
+fa = FaceAlignment(LandmarksType.TWO_D, flip_input=False,device=device_str)
 
 # maker if the bbox is not sufficient 
 coord_placeholder = (0.0,0.0,0.0,0.0)
