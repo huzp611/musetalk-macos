@@ -45,9 +45,24 @@ pip install transformers diffusers accelerate
 pip install librosa soundfile
 ```
 
-### 2.2 编译安装 mmcv (关键步骤)
+### 2.2 安装 mmcv (关键步骤)
 
-macOS ARM 需要从源码编译 mmcv：
+#### 方式一：使用预编译包（推荐，仅限 macOS ARM + Python 3.10）
+
+```bash
+# 解压预编译的 mmcv
+cd /path/to/musetalk-macos
+tar -xzf prebuilt/mmcv-2.1.0-macos-arm64-py310.tar.gz
+
+# 安装（开发模式）
+pip install -e . --no-build-isolation
+```
+
+**注意**：预编译包仅适用于以下环境：
+- macOS 12.0+ (Apple Silicon M1/M2/M3/M4)
+- Python 3.10.x
+
+#### 方式二：从源码编译（通用，约 10-20 分钟）
 
 ```bash
 # 安装编译依赖
