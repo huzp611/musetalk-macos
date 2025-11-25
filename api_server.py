@@ -15,6 +15,7 @@ import uuid
 import shutil
 import asyncio
 import logging
+import signal
 from pathlib import Path
 from typing import Optional
 
@@ -141,13 +142,35 @@ class MuseTalkPipeline:
         self.loaded = True
         logger.info("MuseTalk 模型加载完成")
 
+    def _save_frame(self, frame, path):
+        """保存单帧到磁盘，处理格式和尺寸"""
+        import numpy as np
+        import cv2
+
+        # 确保 frame 是正确的类型
+        if not isinstance(frame, np.ndarray):
+            frame = np.array(frame)
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+
+        # libx264 要求宽高都是偶数
+        h, w = frame.shape[:2]
+        new_w = w if w % 2 == 0 else w - 1
+        new_h = h if h % 2 == 0 else h - 1
+        if new_w != w or new_h != h:
+            frame = frame[:new_h, :new_w]
+
+        cv2.imwrite(str(path), frame)
+
     def generate(
         self,
         source_path: str,
         audio_path: str,
         output_path: str,
         fps: int = 25,
-        bbox_shift: int = 0
+        bbox_shift: int = 0,
+        upper_boundary_ratio: float = 0.5,
+        expand: float = 1.5
     ) -> str:
         """生成说话视频
 
@@ -157,6 +180,8 @@ class MuseTalkPipeline:
             output_path: 输出视频路径
             fps: 帧率
             bbox_shift: 边界框偏移
+            upper_boundary_ratio: 混合区域上边界比例，0.3-0.7，越小保留越多上半脸
+            expand: 人脸区域扩展系数，1.0-2.0，越大混合区域越大
 
         Returns:
             输出视频路径
@@ -239,27 +264,27 @@ class MuseTalkPipeline:
             if len(input_latent_list) == 0:
                 raise ValueError("未能检测到人脸")
 
-            # 循环扩展帧以匹配音频长度
-            input_latent_list_cycle = input_latent_list * ((len(whisper_chunks) // len(input_latent_list)) + 1)
-            input_latent_list_cycle = input_latent_list_cycle[:len(whisper_chunks)]
-            coord_list_cycle = coord_list * ((len(whisper_chunks) // len(coord_list)) + 1)
-            coord_list_cycle = coord_list_cycle[:len(whisper_chunks)]
-            frame_list_cycle = frame_list * ((len(whisper_chunks) // len(frame_list)) + 1)
-            frame_list_cycle = frame_list_cycle[:len(whisper_chunks)]
+            # 提前创建输出帧目录（流式写入，避免内存累积）
+            frame_dir_out = temp_dir / "output_frames"
+            frame_dir_out.mkdir(exist_ok=True)
 
-            # 生成帧
-            output_frames = []
-            logger.info(f"生成 {len(whisper_chunks)} 帧...")
+            # 生成帧（使用索引循环获取，避免大量列表复制）
+            num_chunks = len(whisper_chunks)
+            num_inputs = len(input_latent_list)
+            logger.info(f"生成 {num_chunks} 帧...")
 
-            for idx in tqdm(range(len(whisper_chunks))):
+            import gc
+
+            for idx in tqdm(range(num_chunks)):
                 audio_feature = whisper_chunks[idx]
-                input_latent = input_latent_list_cycle[idx]
-                coord = coord_list_cycle[idx]
-                frame = frame_list_cycle[idx].copy()
+                # 循环索引获取，避免复制整个列表
+                input_latent = input_latent_list[idx % num_inputs]
+                coord = coord_list[idx % num_inputs]
+                frame = frame_list[idx % num_inputs].copy()
 
                 if coord == coord_placeholder:
-                    # 无人脸帧，BGR 转 RGB 保持一致
-                    output_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    # 无人脸帧，直接写入磁盘
+                    self._save_frame(frame, frame_dir_out / f"{idx:08d}.png")
                     continue
 
                 # 使用 UNet 预测
@@ -286,8 +311,8 @@ class MuseTalkPipeline:
                 y1, y2, x1, x2 = coord
                 h, w = y2 - y1, x2 - x1
                 if h <= 0 or w <= 0:
-                    # 无效坐标，BGR 转 RGB 保持一致
-                    output_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    # 无效坐标，直接写入磁盘
+                    self._save_frame(frame, frame_dir_out / f"{idx:08d}.png")
                     continue
                 pred_frame_resized = cv2.resize(pred_frame.astype(np.uint8), (w, h), interpolation=cv2.INTER_LANCZOS4)
 
@@ -298,29 +323,40 @@ class MuseTalkPipeline:
                     frame,  # 完整原图 (BGR)
                     pred_frame_resized,  # 生成的人脸 (BGR)
                     [x1, y1, x2, y2],  # face_box 坐标
+                    upper_boundary_ratio=upper_boundary_ratio,
+                    expand=expand,
                     fp=self.face_parser
                 )
 
-                output_frames.append(frame)
+                # 直接写入磁盘，避免内存累积
+                self._save_frame(frame, frame_dir_out / f"{idx:08d}.png")
 
-            # 保存视频
-            logger.info("保存视频...")
-            frame_dir_out = temp_dir / "output_frames"
-            frame_dir_out.mkdir(exist_ok=True)
+                # 清理当前迭代的中间张量
+                del pred_latent, pred_frames, pred_frame, pred_frame_resized
 
-            for i, frame in enumerate(output_frames):
-                # get_image 返回 RGB 格式，需要转换为 BGR 再保存
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(frame_dir_out / f"{i:08d}.png"), frame_bgr)
+                # 每 50 帧清理一次内存缓存
+                if idx % 50 == 0:
+                    gc.collect()
+                    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
-            # 合成视频
+            # 合成视频（帧已在循环中保存到 frame_dir_out）
             silent_video = str(temp_dir / "silent.mp4")
-            cmd = f'ffmpeg -y -v fatal -r {source_fps} -i "{frame_dir_out}/%08d.png" -c:v libx264 -pix_fmt yuv420p "{silent_video}"'
-            os.system(cmd)
+            frame_count = len(list(frame_dir_out.glob("*.png")))
+            logger.info(f"帧目录: {frame_dir_out}, 帧数: {frame_count}")
+
+            # 检查帧文件是否存在
+            frame_files = list(frame_dir_out.glob("*.png"))
+            logger.info(f"保存的帧文件数: {len(frame_files)}")
+
+            cmd = f'ffmpeg -y -v warning -r {source_fps} -i "{frame_dir_out}/%08d.png" -c:v libx264 -pix_fmt yuv420p "{silent_video}"'
+            ret = os.system(cmd)
+            logger.info(f"ffmpeg 合成视频返回: {ret}")
 
             # 添加音频
-            cmd = f'ffmpeg -y -v fatal -i "{silent_video}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{output_path}"'
-            os.system(cmd)
+            cmd = f'ffmpeg -y -v warning -i "{silent_video}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{output_path}"'
+            ret = os.system(cmd)
+            logger.info(f"ffmpeg 添加音频返回: {ret}")
 
             return output_path
 
@@ -328,6 +364,20 @@ class MuseTalkPipeline:
             # 清理临时文件
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+            # 清理内存
+            import gc
+            gc.collect()
+
+            # 清理 GPU/MPS 缓存
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except:
+                pass
 
 
 def load_pipeline():
@@ -418,7 +468,9 @@ async def generate(
     source: UploadFile = File(..., description="源图像或视频文件"),
     audio: UploadFile = File(..., description="音频文件"),
     fps: int = Form(25, description="帧率"),
-    bbox_shift: int = Form(0, description="边界框偏移"),
+    bbox_shift: int = Form(0, description="边界框偏移，正值向下扩展包含更多下巴，负值向上"),
+    upper_boundary_ratio: float = Form(0.5, description="混合区域上边界比例，0.3-0.7，越小保留越多上半脸"),
+    expand: float = Form(1.5, description="人脸区域扩展系数，1.0-2.0，越大混合区域越大"),
 ):
     """
     生成说话视频
@@ -427,7 +479,9 @@ async def generate(
         source: 源图像（人脸）或视频
         audio: 音频文件
         fps: 帧率（默认25）
-        bbox_shift: 边界框偏移（默认0）
+        bbox_shift: 边界框偏移（默认0），正值向下扩展包含更多下巴
+        upper_boundary_ratio: 混合区域上边界比例（默认0.5），越小保留越多上半脸原图
+        expand: 人脸区域扩展系数（默认1.5），越大混合区域越大越自然
 
     Returns:
         生成的说话视频文件
@@ -462,7 +516,9 @@ async def generate(
             audio_path=str(audio_path),
             output_path=str(output_path),
             fps=fps,
-            bbox_shift=bbox_shift
+            bbox_shift=bbox_shift,
+            upper_boundary_ratio=upper_boundary_ratio,
+            expand=expand
         )
         logger.info(f"[{task_id}] 视频生成完成")
 
@@ -520,8 +576,18 @@ async def cleanup():
         raise HTTPException(status_code=500, detail=f"清理失败: {str(e)}")
 
 
+def signal_handler(signum, frame):
+    """处理 SIGINT 和 SIGTERM 信号"""
+    logger.info(f"收到信号 {signum}，正在关闭服务...")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
     import argparse
+
+    # 注册信号处理器，确保 Ctrl+C 能正常关闭
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     parser = argparse.ArgumentParser(description="MuseTalk API Server")
     parser.add_argument("-a", "--host", default="127.0.0.1", help="服务器地址")
